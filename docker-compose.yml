@@ -1,0 +1,165 @@
+version: '3.8'
+
+services:
+  # TimescaleDB (PostgreSQL with time-series extension)
+  timescaledb:
+    image: timescale/timescaledb:latest-pg15
+    container_name: hygieia-timescaledb
+    environment:
+      POSTGRES_DB: hygieia
+      POSTGRES_USER: hygieia
+      POSTGRES_PASSWORD: hygieia
+    ports:
+      - "5432:5432"
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hygieia"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hygieia-network
+
+  # Redis (for caching and Celery)
+  redis:
+    image: redis:7-alpine
+    container_name: hygieia-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hygieia-network
+
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: hygieia-backend
+    environment:
+      - DATABASE_URL=postgresql://hygieia:hygieia@timescaledb:5432/hygieia
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - backend-logs:/app/logs
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - hygieia-network
+
+  # Celery Worker (for background tasks)
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: hygieia-celery-worker
+    environment:
+      - DATABASE_URL=postgresql://hygieia:hygieia@timescaledb:5432/hygieia
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+    env_file:
+      - .env
+    volumes:
+      - ./backend:/app
+      - celery-logs:/app/logs
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A ingestion.tasks worker --loglevel=info
+    networks:
+      - hygieia-network
+
+  # Celery Beat (for scheduled tasks)
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: hygieia-celery-beat
+    environment:
+      - DATABASE_URL=postgresql://hygieia:hygieia@timescaledb:5432/hygieia
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+    env_file:
+      - .env
+    volumes:
+      - ./backend:/app
+      - celery-logs:/app/logs
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A ingestion.tasks beat --loglevel=info
+    networks:
+      - hygieia-network
+
+  # Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: hygieia-frontend
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    command: npm start
+    networks:
+      - hygieia-network
+
+  # Nginx (reverse proxy for production)
+  nginx:
+    image: nginx:alpine
+    container_name: hygieia-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./docker/nginx/ssl:/etc/nginx/ssl
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - hygieia-network
+    profiles:
+      - production
+
+volumes:
+  timescaledb-data:
+  redis-data:
+  backend-logs:
+  celery-logs:
+
+networks:
+  hygieia-network:
+    driver: bridge
